@@ -216,3 +216,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Dataset & generated output (download via notebook cell)
+data/
+*.png
+*.pdf
