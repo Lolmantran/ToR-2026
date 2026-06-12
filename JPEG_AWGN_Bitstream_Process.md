@@ -8,6 +8,223 @@ becomes unrecoverable (corrupted) as channel noise increases.
 
 ---
 
+## Concrete Walkthrough — One Image End-to-End
+
+The numbers below come from a real STL-10 image (class: *airplane*, 96×96 RGB) processed
+at Q = 73 and two SNR levels: **14 dB** (clean regime) and **10 dB** (transition regime).
+
+---
+
+### A. Load image from STL-10
+
+```
+dataset = STL10(root='./data', split='test', download=True, transform=ToTensor())
+img_tensor, label = dataset[42]               # class = 'airplane'
+img_uint8 = (img_tensor.permute(1,2,0).numpy() * 255).astype(np.uint8)
+# shape: (96, 96, 3)   dtype: uint8   pixel range: [0, 255]
+```
+
+STL-10 stores images as 96×96 RGB (3 channels × 96 × 96 = 27 648 raw bytes per image).
+Each pixel has three 8-bit values (R, G, B).
+
+---
+
+### B. JPEG Compress at Q = 73
+
+```python
+buf = io.BytesIO()
+Image.fromarray(img_uint8).save(buf, format='JPEG', quality=73)
+jpeg_bytes = buf.getvalue()   # raw JPEG bitstream as a Python bytes object
+```
+
+| Quantity | Value |
+|---|---|
+| Raw image size | 27 648 bytes |
+| JPEG Q=73 size | **1 613 bytes** |
+| Compression ratio | **17.1×** |
+| Total bits to transmit | **12 904 bits** |
+
+The first two bytes of every JPEG file are always `FF D8` (the Start-Of-Image marker).
+In binary:
+
+```
+Byte 0 = 0xFF = 1111 1111
+Byte 1 = 0xD8 = 1101 1000
+
+First 16 bits of the bitstream:
+Index:   0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15
+Bit:     1  1  1  1  1  1  1  1  1  1  0  1  1  0  0  0
+```
+
+The full JPEG file has the internal structure:
+
+| Marker | Role | Sensitivity |
+|---|---|---|
+| `FF D8` — SOI | Start-of-image | **1 bit flip → file rejected** |
+| `FF E0` — APP0 | JFIF header / metadata | High |
+| `FF DB` — DQT | Quantisation tables (one per channel) | **Critical — used for every 8×8 block** |
+| `FF C0` — SOF | Frame header (width, height, components) | Critical |
+| `FF C4` — DHT | Huffman code tables | **Critical — used to decode all scan data** |
+| `FF DA` — SOS | Compressed scan data (actual pixel information) | Moderate |
+| `FF D9` — EOI | End-of-image | Low |
+
+---
+
+### C. Convert Bytes → Bits
+
+```python
+bits = np.unpackbits(np.frombuffer(jpeg_bytes, dtype=np.uint8)).astype(np.float32)
+# bits.shape = (12904,)   values in {0.0, 1.0}
+```
+
+```
+First 16 bits: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 0, 0, 0]
+                ← byte 0xFF ──────────────── →← byte 0xD8 ───── →
+```
+
+---
+
+### D. BPSK Modulation — Bits → Symbols
+
+Each bit is mapped to a symbol on the real line:
+
+```
+bit 0  →  symbol −1   (negative electrical signal)
+bit 1  →  symbol +1   (positive electrical signal)
+
+symbols = 2 × bits − 1
+```
+
+```
+First 16 symbols: [+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,−1,+1,+1,−1,−1,−1]
+```
+
+Signal power is exactly 1 (since all symbols are ±1), which simplifies the SNR formula.
+
+---
+
+### E. AWGN Channel — Add Noise
+
+Independent Gaussian noise is added to every symbol:
+
+```
+σ = sqrt( 1 / 10^(SNR_dB / 10) )     [signal power = 1 for BPSK]
+
+received[i] = symbol[i] + noise[i]    noise[i] ~ N(0, σ²)
+```
+
+| SNR | σ (noise std) | Received values (first 16 symbols) |
+|---|---|---|
+| **14 dB** | 0.1995 | `+1.34, +0.91, +1.01, +1.08, +0.84, +1.00, +1.00, +0.65, +1.20, +1.12, −1.12, +0.97, +1.10, −1.05, −1.05, −1.29` |
+| **10 dB** | 0.3162 | `+0.73, +1.08, +0.52, +1.15, +0.59, +0.89, +0.72, +0.67, +1.37, +1.02, −0.60, +0.95, +1.11, −0.56, −1.06, −1.15` |
+
+Note that all received values still have the correct sign here (no bit error in the first 16
+symbols). Errors occur later in the bitstream where noise occasionally flips the sign.
+
+---
+
+### F. Hard-Decision Decoding
+
+A single threshold at **0** recovers the bit:
+
+```
+decoded_bit = 1  if received > 0
+decoded_bit = 0  if received ≤ 0
+```
+
+This is the simplest possible receiver — no soft information, no error correction.
+
+```
+Received (10 dB):   +0.73 +1.08 +0.52 +1.15 ... −0.60 ...
+Decoded bits:          1     1     1     1   ...    0   ...   ← matches original ✓
+
+But somewhere deeper in the 12 904-bit stream:
+  symbol sent  = +1   received = −0.15   decoded = 0   ← BIT ERROR ✗
+```
+
+| SNR | Total bit errors | BER |
+|---|---|---|
+| **14 dB** | **0** out of 12 904 | 0.000000 |
+| **10 dB** | **5** out of 12 904 | 0.000387 |
+
+---
+
+### G. Reconstruct Bytes → JPEG Decode Attempt
+
+```python
+# pack bits back into bytes (same length as original JPEG)
+rec_bytes = np.packbits((decoded_bits > 0.5).astype(np.uint8)).tobytes()[:n_bytes]
+
+# attempt JPEG decode
+try:
+    img_recovered = np.array(Image.open(io.BytesIO(rec_bytes)).convert('RGB'))
+    # SUCCESS — measure PSNR against original
+except Exception:
+    img_recovered = None   # CORRUPTED — JPEG decoder threw an exception
+```
+
+| SNR | Outcome | PSNR vs original |
+|---|---|---|
+| **14 dB** | **OK** — 0 bit errors, file structure intact | **39.4 dB** |
+| **10 dB** | **OK** — 5 bit errors, all landed in scan data | **6.2 dB** (heavy artefacts) |
+
+> **Why does 0 errors give 39.4 dB instead of ∞?**
+> JPEG compression itself is lossy. The 39.4 dB is the JPEG compression distortion at Q=73,
+> not channel noise — the channel added nothing extra at 14 dB.
+
+> **Why does 5 bit errors give only 6.2 dB?**
+> In JPEG, errors in the compressed scan data (SOS) corrupt the Huffman-coded symbol stream.
+> One flip misaligns the decoder's parsing position, causing a cascade of wrong coefficient
+> values in every 8×8 DCT block decoded after the error position.
+
+---
+
+### H. How Corruption is Detected
+
+**Corruption = JPEG decoder raises an exception.**
+
+The JPEG decoder (`PIL.Image.open().load()`) performs internal consistency checks:
+
+1. **Marker sequence validation** — checks that `FF D8` is present, markers are in a valid order
+2. **Huffman table integrity** — verifies code lengths sum correctly
+3. **Quantisation table range** — all 64 entries must be in [1, 255]
+4. **Image dimensions** — width/height from SOF must be positive and consistent
+5. **End-of-image marker** — `FF D9` must be present at the correct position
+
+Any inconsistency raises an exception. The image is then classified as **corrupted** and
+counts toward the corruption rate:
+
+```
+Corruption Rate @ SNR = N_corrupted / N_total
+
+Example results (N=5000, Q=73):
+  SNR= 0 dB  →  5000/5000 (100.0%) corrupted
+  SNR=10 dB  →  2991/5000  (59.8%) corrupted
+  SNR=11 dB  →  1009/5000  (20.2%) corrupted
+  SNR=12 dB  →   198/5000   (4.0%) corrupted
+  SNR=13 dB  →    31/5000   (0.6%) corrupted
+  SNR=14 dB  →     2/5000   (0.0%) corrupted
+  SNR≥16 dB  →     0/5000   (0.0%) corrupted
+```
+
+---
+
+### I. Summary: Full Pipeline in One Table
+
+| Stage | Input | Output | Key formula |
+|---|---|---|---|
+| **Load** | STL-10 index | RGB uint8 (96×96×3) | — |
+| **JPEG encode** | RGB uint8 | bytes (≈1–4 KB) | PIL save Q=73 |
+| **Unpack bits** | bytes | {0,1} array, length = 8×bytes | `np.unpackbits` |
+| **BPSK map** | {0,1} | {−1,+1} | `s = 2b − 1` |
+| **AWGN** | {−1,+1} | floats | `r = s + N(0, σ²)`, `σ=1/√10^(SNR/10)` |
+| **Hard decide** | floats | {0,1} | `b̂ = (r > 0)` |
+| **Pack bytes** | {0,1} | bytes | `np.packbits` |
+| **JPEG decode** | bytes | RGB uint8 **or** exception | PIL open/load |
+| **PSNR** | original vs recovered | dB | `10 log₁₀(255²/MSE)` |
+
+---
+
 ## Step-by-Step Process
 
 ### Step 1 — JPEG Compression (Source Coding)
