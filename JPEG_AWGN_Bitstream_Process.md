@@ -379,25 +379,107 @@ increases from ~8 dB to ~16 dB.
 
 ---
 
-## Corruption Rate vs SNR Curve
+## What is SNR?
+
+**Signal-to-Noise Ratio (SNR)** measures how much stronger the intended signal is
+compared to the background noise, expressed in decibels (dB):
 
 ```
-Corruption
-Rate (R)
-  1.0 |**
-      |  **
-  0.8 |    *
-      |     *
-  0.6 |      *
-      |       **
-  0.4 |         *
-      |          **
-  0.2 |            ***
-      |               ****
-  0.0 +----+----+----+----+----+----
-      0    4    8   12   16   20
-                  SNR (dB)
+SNR_dB = 10 × log₁₀( signal power / noise power )
 ```
+
+A higher SNR means a cleaner channel. For BPSK with unit signal power (symbols = ±1),
+the noise standard deviation is:
+
+```
+σ = 1 / √10^(SNR/10)
+
+SNR =  0 dB  →  σ = 1.000  (noise as strong as the signal — many flips)
+SNR = 10 dB  →  σ = 0.316  (noise about 1/3 of signal strength)
+SNR = 14 dB  →  σ = 0.200  (noise about 1/5 of signal strength)
+SNR = 20 dB  →  σ = 0.100  (noise about 1/10 of signal strength)
+```
+
+In practice, SNR encodes the physical quality of the wireless or wired channel — a weak
+Wi-Fi signal, a satellite link, or interference from other devices all lower the SNR.
+
+---
+
+## What is PSNR?
+
+**Peak Signal-to-Noise Ratio (PSNR)** measures image reconstruction quality — how
+similar a received image is to the original:
+
+```
+PSNR = 10 × log₁₀( 255² / MSE )
+
+where  MSE = mean squared error per pixel, averaged over all pixels and channels.
+```
+
+The value 255 is the peak possible pixel value for an 8-bit image. PSNR is in dB —
+higher means better. Rough perceptual guidelines:
+
+| PSNR | Perceptual quality |
+|---|---|
+| > 40 dB | Essentially identical — differences invisible |
+| 30–40 dB | Good quality — minor compression artefacts at most |
+| 20–30 dB | Noticeable degradation — visible noise or block artefacts |
+| < 20 dB | Severely corrupted — content barely recognisable |
+| ∞ | Perfect reconstruction (MSE = 0) |
+
+PSNR is used here instead of a subjective rating because it is deterministic,
+fast to compute, and widely used as a baseline metric in image transmission research.
+Its main limitation is that it does not always match human perception (two images can
+have the same PSNR but look very different), which is why later work often adds SSIM
+or a learned perceptual metric.
+
+---
+
+## Why 14 dB and 10 dB Were Chosen as Reference Points
+
+The two SNR values appear repeatedly throughout the walkthrough and plots because they
+bracket the **critical transition zone** of the corruption curve:
+
+**14 dB — the "clean" reference point**
+
+At SNR = 14 dB the experimental corruption rate drops to ≈ 0% (only 2 out of 5 000
+images failed). This is the point where the BPSK channel becomes effectively error-free
+for a ~13 000-bit JPEG file: the expected number of bit errors per image is
+
+```
+E[errors] = BER × L = 0.004% × 12 904 ≈ 0.5 bits per image on average
+```
+
+so most images have zero errors, and the few that have one error usually survive
+because the error lands in the scan data rather than a critical header.
+At 14 dB, PSNR equals the JPEG-only compression PSNR (~30–39 dB depending on image
+content) — the channel contributes no extra distortion.
+
+**10 dB — the "transitional" reference point**
+
+At SNR = 10 dB the corruption rate is ≈ 60%. This is the steepest part of the sigmoid
+curve — small changes in SNR cause large changes in reliability. The expected number
+of bit errors per image is
+
+```
+E[errors] = 0.08% × 12 904 ≈ 10 bits per image
+```
+
+Images that survive (≈ 40%) did so because their errors all landed in the SOS scan
+payload. Their PSNR is low (≈ 10 dB) because a single mis-parsed Huffman codeword
+cascades into hundreds of wrong DCT coefficients.
+
+Together, these two points define the **boundary of the transition region**:
+
+```
+SNR < 10 dB  →  essentially all images destroyed (classical JPEG fails completely)
+10–13 dB     →  unreliable — some survive, some do not (transition zone)
+SNR ≥ 14 dB  →  essentially all images survive (JPEG succeeds)
+```
+
+This is why the ToR 2026 project targets SNRs of **0–14 dB** as the operating range
+for the deep JSCC system: these are exactly the conditions where JPEG transmission is
+unreliable or impossible.
 
 ---
 
@@ -405,37 +487,13 @@ Rate (R)
 
 For images that are successfully decoded:
 
-- At **high SNR** (> 14 dB): almost no bit errors — PSNR approaches the JPEG-only
-  compression PSNR (~30–35 dB at Q=73)
-- At **medium SNR** (10–14 dB): some scan-data errors produce visible artefacts —
-  PSNR drops below JPEG-only quality
-- At **low SNR** (< 10 dB): very few images survive; those that do had 0 errors by
-  chance — PSNR equals clean JPEG PSNR but sample size is very small
+- At **high SNR** (≥ 14 dB): zero or near-zero bit errors — PSNR equals the JPEG-only
+  compression quality (~30–39 dB at Q=73); the channel adds no extra distortion.
+- At **medium SNR** (10–13 dB): a few errors survive into the scan data, misaligning
+  Huffman decoding and corrupting entire DCT blocks — PSNR can drop to 6–20 dB even
+  for images that technically decoded without an exception.
+- At **low SNR** (< 10 dB): almost no images survive; the rare ones that do had 0
+  errors purely by chance, so their PSNR equals the clean JPEG PSNR, but the sample
+  size is too small to be statistically meaningful.
 
 ---
-
-## Connection to the ToR 2026 Project
-
-This experiment models the classical **separate source-channel coding** pipeline:
-
-```
-[Image]
-  -> JPEG Encoder  (source coding, Q=73)
-  -> BPSK Modulator
-  -> AWGN Channel
-  -> BPSK Hard Decoder
-  -> JPEG Decoder
-  -> [Recovered Image or CORRUPTED]
-```
-
-**Key limitation**: JPEG was designed for compression, not channel robustness.
-It has zero error protection — a single bit flip in the wrong place destroys the image.
-
-The goal of this project is to design a **Joint Source-Channel Coding (JSCC)** deep
-learning system that encodes images directly into channel-robust representations,
-outperforming this separate pipeline, especially at low SNR (0–10 dB) where JPEG
-transmission fails almost completely.
-
----
-
-*Dataset: STL-10 (96×96 RGB) | JPEG Quality: Q=73 | Channel: BPSK over AWGN | SNR range: 0–20 dB*
