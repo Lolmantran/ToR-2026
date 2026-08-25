@@ -221,3 +221,22 @@ __marimo__/
 data/
 *.png
 *.pdf
+
+# Model checkpoints / weights (large; retrain or download separately)
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.bin
+checkpoints/
+checkpoints_fixed/
+checkpoints_smoke/
+
+# Data archives
+*.tar.gz
+*.tar
+*.zip
+*.npz
+
+# Logs
+*.log
